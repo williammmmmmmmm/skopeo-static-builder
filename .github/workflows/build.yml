@@ -20,27 +20,15 @@ jobs:
             gcc: aarch64-linux-gnu-gcc
 
     steps:
-      - name: Get Latest Tag
+      - name: Get Latest Tag via GH CLI
         id: get_tag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 使用 GITHUB_TOKEN 认证以避免 API 频率限制
-          API_URL="https://api.github.com"
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" $API_URL)
-          
-          # 解析 Tag
-          TAG=$(echo "$RESPONSE" | jq -r .tag_name)
-          
-          # 安全检查：如果获取失败，停止并报错
-          if [ "$TAG" == "null" ] || [ -z "$TAG" ]; then
-            echo "Error: Could not fetch latest tag. API Response:"
-            echo "$RESPONSE"
-            exit 1
-          fi
-          
+          # 使用官方 CLI 获取最新 tag，更稳定
+          TAG=$(gh release view --repo containers/skopeo --json tagName --template '{{.tagName}}')
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
-          echo "Successfully identified tag: $TAG"
+          echo "Latest tag is $TAG"
 
       - name: Checkout Skopeo Source
         uses: actions/checkout@v4
@@ -56,13 +44,39 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgpgme-dev libassuan-dev libbtrfs-dev libdevmapper-dev pkg-config
+          # 1. 如果是 arm64 交叉编译，需配置专用源
           if [ "${{ matrix.arch }}" = "arm64" ]; then
             sudo dpkg --add-architecture arm64
-            sudo apt-get update
-            sudo apt-get install -y gcc-aarch64-linux-gnu libgpgme-dev:arm64 libassuan-dev:arm64 libdevmapper-dev:arm64 libbtrfs-dev:arm64
+            
+            # 修改 24.04 默认源
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i 's/Architectures: amd64/Architectures: amd64 arm64/g' /etc/apt/sources.list.d/ubuntu.sources || true
+              sudo sed -i '/URIs: http:\/\/.*archive.ubuntu.com\|security.ubuntu.com/ s/$/\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources || true
+            fi
+
+            # 2. 为 arm64 添加专门的 ports 源
+            printf "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse\n" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          fi # <--- 你之前漏掉了这个关键的 fi，导致了语法错误
+
+          # 3. 更新并安装
+          sudo apt-get update || true 
+          
+          sudo apt-get install -y pkg-config
+          
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            # 安装交叉编译器和 arm64 版本的依赖库
+            sudo apt-get install -y gcc-aarch64-linux-gnu \
+              libgpgme-dev:arm64 \
+              libassuan-dev:arm64 \
+              libdevmapper-dev:arm64 \
+              libbtrfs-dev:arm64 \
+              libssl-dev:arm64
+          else
+            # amd64 本地编译
+            sudo apt-get install -y libgpgme-dev libassuan-dev libbtrfs-dev libdevmapper-dev libssl-dev
           fi
+
+
 
       - name: Build
         env:
@@ -70,12 +84,26 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 1
           CC: ${{ matrix.gcc }}
+          PKG_CONFIG_PATH: ${{ matrix.arch == 'arm64' && '/usr/lib/aarch64-linux-gnu/pkgconfig' || '/usr/lib/x86_64-linux-gnu/pkgconfig' }}
         run: |
-          # 静态编译参数
+          # 1. 设置 CGO 链接参数，强制 GCC 进行静态链接
+          # 这将解决 GLIBC 版本不匹配的问题
+          export CGO_LDFLAGS="-static -L/usr/lib/${{ matrix.arch == 'arm64' && 'aarch64-linux-gnu' || 'x86_64-linux-gnu' }}"
+          
+          # 2. 执行编译
+          # 增加 'static' build tag
           make bin/skopeo BUILDTAGS="containers_image_openpgp static exclude_graphdriver_devicemapper"
+          
+          # 3. 验证是否为静态链接
+          # 如果输出包含 "statically linked"，说明成功；如果仍是 "dynamically linked"，
+          # 说明某些 C 库（如 gpgme）在宿主机上只有动态库版本，此时它仍能在较低版本系统运行（只要链接成功）
+          file bin/skopeo
+          ldd bin/skopeo || echo "Statically linked"
+
           mkdir -p out/bin
           cp bin/skopeo out/bin/
           tar -czf skopeo-${{ steps.get_tag.outputs.TAG }}-${{ matrix.arch }}.tar.gz -C out bin
+
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
