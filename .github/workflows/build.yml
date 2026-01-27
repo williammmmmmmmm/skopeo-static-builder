@@ -1,0 +1,92 @@
+name: build-skopeo-static
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # 支持手动点击按钮触发
+
+jobs:
+  build:
+    name: Build for ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            gcc: gcc
+          - arch: arm64
+            goarch: arm64
+            gcc: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: Get Latest Tag
+        id: get_tag
+        run: |
+          # 获取远程最新版本号
+          TAG=$(curl -s https://api.github.com | jq -r .tag_name)
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Checkout Skopeo Source
+        uses: actions/checkout@v4
+        with:
+          repository: containers/skopeo
+          ref: ${{ steps.get_tag.outputs.TAG }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgpgme-dev libassuan-dev libbtrfs-dev libdevmapper-dev pkg-config
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            sudo dpkg --add-architecture arm64
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu libgpgme-dev:arm64 libassuan-dev:arm64 libdevmapper-dev:arm64 libbtrfs-dev:arm64
+          fi
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CC: ${{ matrix.gcc }}
+        run: |
+          # 静态编译参数
+          make bin/skopeo BUILDTAGS="containers_image_openpgp static exclude_graphdriver_devicemapper"
+          mkdir -p out/bin
+          cp bin/skopeo out/bin/
+          tar -czf skopeo-${{ steps.get_tag.outputs.TAG }}-${{ matrix.arch }}.tar.gz -C out bin
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: skopeo-${{ matrix.arch }}
+          path: skopeo-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./
+          pattern: skopeo-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          tag: "latest-build"
+          name: "Skopeo Auto Build"
+          artifacts: "skopeo-*.tar.gz"
+          body: "This is an automated static build of the latest Skopeo release."
+
