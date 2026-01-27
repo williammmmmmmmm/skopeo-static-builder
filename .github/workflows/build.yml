@@ -22,16 +22,32 @@ jobs:
     steps:
       - name: Get Latest Tag
         id: get_tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 获取远程最新版本号
-          TAG=$(curl -s https://api.github.com | jq -r .tag_name)
+          # 使用 GITHUB_TOKEN 认证以避免 API 频率限制
+          API_URL="https://api.github.com"
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" $API_URL)
+          
+          # 解析 Tag
+          TAG=$(echo "$RESPONSE" | jq -r .tag_name)
+          
+          # 安全检查：如果获取失败，停止并报错
+          if [ "$TAG" == "null" ] || [ -z "$TAG" ]; then
+            echo "Error: Could not fetch latest tag. API Response:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+          
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "Successfully identified tag: $TAG"
 
       - name: Checkout Skopeo Source
         uses: actions/checkout@v4
         with:
           repository: containers/skopeo
-          ref: ${{ steps.get_tag.outputs.TAG }}
+          ref: ${{ steps.get_tag.outputs.TAG }} # 此时确保了 TAG 绝对不为 null
+
 
       - name: Setup Go
         uses: actions/setup-go@v5
