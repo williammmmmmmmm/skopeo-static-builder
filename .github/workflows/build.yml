@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch: # 支持手动点击按钮触发
+  schedule:
+  # 每天凌晨 2 点（UTC时间，即北京时间上午10点）触发一次
+  # https://crontab.guru/ 是一个设置 cron 的好帮手
+  - cron: '0 2 * * *' 
 
 jobs:
   build:
@@ -18,7 +22,9 @@ jobs:
           - arch: arm64
             goarch: arm64
             gcc: aarch64-linux-gnu-gcc
-
+    outputs:
+      # 定义一个作业输出变量
+      VERSION:  $ {{ steps.get_tag.outputs.TAG }}
     steps:
       - name: Get Latest Tag via GH CLI
         id: get_tag
@@ -37,12 +43,31 @@ jobs:
           ref: ${{ steps.get_tag.outputs.TAG }} # 此时确保了 TAG 绝对不为 null
 
 
+      - name: Check if Tag Exists in This Repo
+        id: check_tag
+        env:
+          GITHUB_TOKEN:  $ {{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME=" $ {{ steps.get_tag.outputs.TAG }}"
+          
+          # 使用 GitHub API 检查该 Tag 是否已存在
+          # 注意：这里检查的是 Git Tag，Release 是基于 Tag 的
+          if gh api "/repos/ $ {{ github.repository }}/git/ref/tags/ $ TAG_NAME" --silent; then
+            echo "Tag  $ TAG_NAME 已存在，无需重新编译。"
+            echo "SKIP_BUILD=true" >>  $ GITHUB_OUTPUT
+          else
+            echo "Tag  $ TAG_NAME 不存在，准备编译。"
+            echo "SKIP_BUILD=false" >>  $ GITHUB_OUTPUT
+          fi
+
       - name: Setup Go
+        if: steps.check_tag.outputs.SKIP_BUILD != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
       - name: Install Dependencies
+        if: steps.check_tag.outputs.SKIP_BUILD != 'true'
         run: |
           # 1. 如果是 arm64 交叉编译，需配置专用源
           if [ "${{ matrix.arch }}" = "arm64" ]; then
@@ -79,6 +104,7 @@ jobs:
 
 
       - name: Build
+        if: steps.check_tag.outputs.SKIP_BUILD != 'true'
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
@@ -106,10 +132,17 @@ jobs:
 
 
       - name: Upload Artifacts
+        if: steps.check_tag.outputs.SKIP_BUILD != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: skopeo-${{ matrix.arch }}
           path: skopeo-*.tar.gz
+          
+      - name: Expose Version
+        if: steps.check_tag.outputs.SKIP_BUILD != 'true'
+        run: |
+          # 将版本号传递给依赖此 Job 的其他 Job
+          echo "VERSION= $ {{ steps.get_tag.outputs.TAG }}" >>  $ GITHUB_OUTPUT
 
   release:
     needs: build
@@ -125,12 +158,13 @@ jobs:
           merge-multiple: true
 
       - name: Create GitHub Release
+        if: needs.build.outputs.VERSION != ''
         uses: ncipollo/release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true
-          tag: "latest-build"
-          name: "Skopeo Auto Build"
+          # ⚠️ 关键：这里使用动态的 Tag 名
+          tag:  $ {{ needs.build.outputs.VERSION }} # 直接使用上游的 Tag
+          name: "Skopeo Auto Build  $ {{ needs.build.outputs.VERSION }}"
           artifacts: "skopeo-*.tar.gz"
-          body: "This is an automated static build of the latest Skopeo release."
-
+          body: "Automated static build for Skopeo  $ {{ needs.build.outputs.VERSION }}"
