@@ -7,7 +7,7 @@ on:
   schedule:
   # 每天凌晨 2 点（UTC时间，即北京时间上午10点）触发一次
   # https://crontab.guru/ 是一个设置 cron 的好帮手
-  - cron: '0 2 * * *' 
+  - cron: '0 2 */7 * *' 
 
 jobs:
   build:
@@ -24,7 +24,7 @@ jobs:
             gcc: aarch64-linux-gnu-gcc
     outputs:
       # 定义一个作业输出变量
-      VERSION:  $ {{ steps.get_tag.outputs.TAG }}
+      VERSION:  ${{ steps.get_tag.outputs.TAG }}
     steps:
       - name: Get Latest Tag via GH CLI
         id: get_tag
@@ -46,13 +46,13 @@ jobs:
       - name: Check if Tag Exists in This Repo
         id: check_tag
         env:
-          GITHUB_TOKEN:  $ {{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME=" $ {{ steps.get_tag.outputs.TAG }}"
+          TAG_NAME="${{ steps.get_tag.outputs.TAG }}"
           
           # 使用 GitHub API 检查该 Tag 是否已存在
           # 注意：这里检查的是 Git Tag，Release 是基于 Tag 的
-          if gh api "/repos/ $ {{ github.repository }}/git/ref/tags/ $ TAG_NAME" --silent; then
+          if gh api "/repos/ ${{ github.repository }}/git/ref/tags/ $ TAG_NAME" --silent; then
             echo "Tag  $ TAG_NAME 已存在，无需重新编译。"
             echo "SKIP_BUILD=true" >>  $ GITHUB_OUTPUT
           else
@@ -66,31 +66,59 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Install Dependencies
+      - name: Install Dependencies (Fixed for Noble)
         if: steps.check_tag.outputs.SKIP_BUILD != 'true'
         run: |
-          # 1. 如果是 arm64 交叉编译，需配置专用源
           if [ "${{ matrix.arch }}" = "arm64" ]; then
+            echo "⚙️ 配置 ARM64 交叉编译环境..."
+
+            # 1. 注册架构
             sudo dpkg --add-architecture arm64
-            
-            # 修改 24.04 默认源
-            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-              sudo sed -i 's/Architectures: amd64/Architectures: amd64 arm64/g' /etc/apt/sources.list.d/ubuntu.sources || true
-              sudo sed -i '/URIs: http:\/\/.*archive.ubuntu.com\|security.ubuntu.com/ s/$/\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources || true
+
+            # 2. 暴力清理旧源配置，防止冲突
+            echo "🧹 清空 /etc/apt/sources.list.d/ ..."
+            sudo rm -f /etc/apt/sources.list.d/* 
+            sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+            # 3. 重写默认源 (仅保留 amd64)
+            # 目的：下载交叉编译工具链 (gcc-aarch64-linux-gnu)
+            echo "📝 写入 amd64 默认源..."
+            echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list
+            echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+            echo "deb [arch=amd64] http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+
+            # 4. 写入 arm64 Ports 源
+            # 目的：下载目标库文件
+            echo "📝 写入 arm64 Ports 源..."
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+
+          else
+            echo "⚙️ 判断为 AMD64 本地编译环境..."
+          fi
+
+      - name: Install Dependencies
+        run: |
+          # 1. 清理并更新索引
+          sudo apt-get clean
+          sudo apt-get update --fix-missing
+
+          # 2. 安装通用工具
+          sudo apt-get install -y pkg-config
+
+          # 3. 安装特定依赖
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            # 安装交叉编译器
+            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+
+            # 严格检查编译器
+            if ! command -v aarch64-linux-gnu-gcc &> /dev/null; then
+              echo "❌ 交叉编译器安装失败！"
+              exit 1
             fi
 
-            # 2. 为 arm64 添加专门的 ports 源
-            printf "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse\n" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
-          fi # <--- 你之前漏掉了这个关键的 fi，导致了语法错误
-
-          # 3. 更新并安装
-          sudo apt-get update || true 
-          
-          sudo apt-get install -y pkg-config
-          
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            # 安装交叉编译器和 arm64 版本的依赖库
-            sudo apt-get install -y gcc-aarch64-linux-gnu \
+            # 安装 arm64 依赖库
+            sudo apt-get install -y \
               libgpgme-dev:arm64 \
               libassuan-dev:arm64 \
               libdevmapper-dev:arm64 \
@@ -98,8 +126,15 @@ jobs:
               libssl-dev:arm64
           else
             # amd64 本地编译
-            sudo apt-get install -y libgpgme-dev libassuan-dev libbtrfs-dev libdevmapper-dev libssl-dev
+            sudo apt-get install -y \
+              libgpgme-dev \
+              libassuan-dev \
+              libbtrfs-dev \
+              libdevmapper-dev \
+              libssl-dev
           fi
+
+
 
 
 
@@ -142,7 +177,7 @@ jobs:
         if: steps.check_tag.outputs.SKIP_BUILD != 'true'
         run: |
           # 将版本号传递给依赖此 Job 的其他 Job
-          echo "VERSION= $ {{ steps.get_tag.outputs.TAG }}" >>  $ GITHUB_OUTPUT
+          echo "VERSION= ${{ steps.get_tag.outputs.TAG }}" >>  $ GITHUB_OUTPUT
 
   release:
     needs: build
@@ -164,7 +199,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true
           # ⚠️ 关键：这里使用动态的 Tag 名
-          tag:  $ {{ needs.build.outputs.VERSION }} # 直接使用上游的 Tag
-          name: "Skopeo Auto Build  $ {{ needs.build.outputs.VERSION }}"
+          tag:  ${{ needs.build.outputs.VERSION }} # 直接使用上游的 Tag
+          name: "Skopeo Auto Build  ${{ needs.build.outputs.VERSION }}"
           artifacts: "skopeo-*.tar.gz"
-          body: "Automated static build for Skopeo  $ {{ needs.build.outputs.VERSION }}"
+          body: "Automated static build for Skopeo  ${{ needs.build.outputs.VERSION }}"
